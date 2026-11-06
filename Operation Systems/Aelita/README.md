@@ -269,6 +269,11 @@ ls -l /usr/bin/startxfce4
 Ни `firefox`, ни `google-chrome`, ни `yandex-browser` в репозиториях Aelita нет (см. 3.3).
 Chromium из EPEL ставится, но для видео непригоден, поэтому берём официальный RPM от Google.
 
+> **Запомнить сразу:** Chrome не работает под `root`. Если в xrdp зашли как `root`, браузер
+> не стартует без `--no-sandbox` — это самая частая причина «Chrome не запускается».
+> Рабочая схема: установка от root, работа — под обычным пользователем (раздел 8).
+> Полный разбор причин — 5.4.
+
 ### 5.1. Почему не Chromium из EPEL
 
 Причин две, и вторая важнее первой.
@@ -383,7 +388,7 @@ ldd /opt/google/chrome/chrome | grep "not found" || echo "все библиот�
 ```
 
 ```
-Google Chrome 157.0.8103.38     # на момент проверки
+Google Chrome 157.0.8103.38     # версия на момент написания; у вас может быть новее
 ```
 
 Проверка кодеков — тем же `probe.html` из 5.1, только другим бинарником:
@@ -400,9 +405,33 @@ HEVC (`hvc1`) может остаться `false`: на Linux Chrome декод�
 VA-API, а в сессии xrdp аппаратного декодера нет. Для камер это обычно не проблема — почти
 все регистраторы умеют отдавать H.264 (в настройках это часто «второй поток» / sub-stream).
 
-### 5.4. `--no-sandbox` и запуск в сессии xrdp
+### 5.4. Chrome не запускается: разбор причин
 
-**Chrome не стартует под root.** В stderr (и в логе) при запуске:
+**Сначала — главное напоминание.** Всё, что ниже, чаще всего упирается в одно: **в xrdp
+зашли под `root`**. Chrome отказывается работать от root без `--no-sandbox` (см. 5.4.1).
+Гайд рассчитан на обычного пользователя (`test1`/`test2`, раздел 8); root нужен только на
+время установки пакетов.
+
+Диагностика всегда начинается одинаково — запуск из терминала **внутри xrdp-сессии**:
+
+```bash
+google-chrome-stable 2>&1 | head -30
+```
+
+С иконки ошибку не видно: stderr уходит в никуда. По тексту ошибки и находим причину:
+
+| Что видно | Причина | Куда смотреть |
+|---|---|---|
+| `Running as root without --no-sandbox is not supported` | сессия под root | 5.4.1 |
+| `error while loading shared libraries: libXXX.so.N` | не хватает библиотек | 5.4.2 |
+| `Failed to connect to the bus` и сразу выход | нет D-Bus в сессии | 5.4.3 |
+| окно есть, но чёрное / артефакты / `GPU process isn't usable` | нет аппаратного GL | 5.4.4 |
+| падает на тяжёлых страницах, `Failed to map ... /dev/shm` | мало `/dev/shm` | 5.4.5 |
+| `The profile appears to be in use by another Chrome process` | залипший singleton-lock | 5.4.6 |
+| с иконки не запускается, из терминала — да | ярлык | 5.4.7 |
+| процесс молча умирает за пару секунд | смотреть coredump | 5.4.8 |
+
+#### 5.4.1. Запуск под root
 
 ```
 [FATAL:zygote_host_impl_linux.cc(90)] Running as root without --no-sandbox is not supported.
@@ -434,16 +463,150 @@ grep '^Exec=' ~/.local/share/applications/google-chrome.desktop
 
 Все строки `Exec=` должны начинаться с `/usr/bin/google-chrome-stable --no-sandbox`.
 
-**Чёрное окно или падения.** У `xorgxrdp` нет аппаратного OpenGL (см. 6.5) — добавьте
-`--disable-gpu` туда же:
+Проверить, под кем вы вообще сидите:
+
+```bash
+id -u          # 0 — это root
+whoami
+```
+
+#### 5.4.2. Не хватает библиотек
+
+```
+error while loading shared libraries: libgbm.so.1: cannot open shared object file
+```
+
+RPM Chrome зависит от многих библиотек, которых в minimal-установке может не быть. Полный
+список недостающих:
+
+```bash
+ldd /opt/google/chrome/chrome | grep "not found"
+```
+
+Ставим разом весь типовой набор — dnf сам отметит уже установленное:
+
+```bash
+dnf -y install mesa-libgbm atk at-spi2-atk cups-libs libXcomposite libXdamage \
+  libXrandr libxkbcommon libxshmfence nss alsa-lib liberation-fonts
+```
+
+#### 5.4.3. Нет D-Bus
+
+```
+Failed to connect to the bus: Could not parse server address
+```
+
+Штатная сессия Xfce через xrdp поднимает D-Bus сама. Если сессия собрана нестандартно
+(ручной `startx`, чужой `~/.xsession`), запускаем через шину:
+
+```bash
+dbus-launch google-chrome-stable
+```
+
+То же можно прописать в ярлыке (`Exec=dbus-launch /usr/bin/google-chrome-stable ...`).
+
+#### 5.4.4. Нет аппаратного OpenGL
+
+У `xorgxrdp` нет DRI/GL (в логе Xorg: `AIGLX: Screen 0 is not DRI2 capable`, см. 6.5).
+Симптомы — чёрное окно, артефакты перерисовки, падения GPU-процесса. Лечится отключением
+аппаратного ускорения:
+
+```bash
+google-chrome-stable --disable-gpu
+```
+
+Постоянно — в ярлыке:
 
 ```
 Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-gpu %U
 ```
 
-**С иконки ничего не происходит, сообщений нет.** Запустите из `xfce4-terminal` в той же
-xrdp-сессии: текст ошибки (в том числе про root и песочницу) уходит в stderr, а из ярлыка
-его не видно.
+#### 5.4.5. Мало `/dev/shm`
+
+Симптом: падения на тяжёлых страницах, в логе `Failed to map ... /dev/shm` или
+`Out of memory`. В контейнерах и урезанных системах `/dev/shm` бывает 64 МБ.
+
+```bash
+df -h /dev/shm
+```
+
+Обход (без правки `fstab`):
+
+```bash
+google-chrome-stable --disable-dev-shm-usage
+```
+
+#### 5.4.6. Профиль занят или повреждён
+
+```
+The profile appears to be in use by another Chrome process on another computer
+```
+
+Значит, остался `SingletonLock` от аварийно завершённого процесса:
+
+```bash
+ls -l ~/.config/google-chrome/Singleton*
+rm -f ~/.config/google-chrome/Singleton*
+```
+
+Проверка «чистого» профиля (не трогая рабочий):
+
+```bash
+google-chrome-stable --user-data-dir=/tmp/chrome-test
+```
+
+Если в чистом профиле запускается, а в обычном нет — виноват профиль: расширения, кэш,
+испорченные настройки. Лечится переносом `~/.config/google-chrome` в сторону и настройкой
+заново.
+
+#### 5.4.7. С иконки не запускается, из терминала — запускается
+
+Тогда дело не в Chrome, а в ярлыке: битый `Exec=`, отсутствующий `%U`, ярлык указывает на
+`chromium-browser` или на несуществующий путь. Проверить и запустить без мыши:
+
+```bash
+grep '^Exec=' /usr/share/applications/google-chrome.desktop
+gtk-launch google-chrome
+```
+
+#### 5.4.8. Процесс молча умирает
+
+```bash
+coredumpctl list google-chrome --no-pager | tail
+coredumpctl info google-chrome --no-pager | head -40
+```
+
+И подробный лог самого Chrome:
+
+```bash
+google-chrome-stable --enable-logging=stderr --v=1 2>&1 | tail -40
+```
+
+Что искать в выводе: `not found` (библиотеки), `Permission denied` (права на профиль или
+`/opt/google/chrome/chrome-sandbox`), `No space left on device` (диск), `namespace`
+(песочница — тогда `--no-sandbox`).
+
+#### 5.4.9. Минимальный запуск и «если ничего не помогло»
+
+Собрать все обходы сразу и посмотреть, стартует ли вообще:
+
+```bash
+google-chrome-stable --no-sandbox --disable-gpu --disable-dev-shm-usage
+```
+
+Если так работает — убирайте флаги по одному и находите нужный минимум.
+
+Если не работает ничего:
+
+```bash
+df -h /                                  # место на диске
+rpm -V google-chrome-stable              # целостность файлов
+dnf -y reinstall google-chrome-stable    # переустановка из google-chrome.repo
+journalctl -b -p err --no-pager | tail   # ошибки системы
+```
+
+SELinux на Aelita выключен (`getenforce` → `Disabled`, раздел 0), поэтому блокировки
+`chrome-sandbox` по SELinux здесь быть не может — не тратьте на это время.
 
 ### 5.5. Откат
 
@@ -781,6 +944,11 @@ test1 hash: $sm3$
 Обратите внимание: в Aelita пароли хэшируются по **SM3** (`$sm3$`), а не SHA-512.
 PAM и xrdp с этим работают штатно — проверено входом через RDP.
 
+> **Под root в xrdp работать нельзя.** Root нужен только на время установки и настройки.
+> Chrome под root не стартует без `--no-sandbox` (5.4.1), у LibreOffice под root путаются
+> права на профиль (`~/.config/libreoffice` остаётся root-овым и потом не открывается у
+> обычного пользователя). Ежедневная работа — только под `test1`/`test2`.
+
 ### 8.2. faillock
 
 В PAM жёстко задано `deny=3 unlock_time=180`: три неудачных попытки — и учётная запись
@@ -907,9 +1075,13 @@ library versions: OpenSSL 1.1.1wa  16 Nov 2023, LZO 2.08
 | `PAM: The account is locked due to 3 failed logins` | `faillock deny=3` | `faillock --user <u> --reset`; ослабить, см. 8.2 |
 | Сессия открывается в GNOME, а не в Xfce | `DefaultWindowManager` относительный, взят из `/usr/libexec/xrdp/` | прописать абсолютный путь (7.2) |
 | `nothing provides libffi.so.6` при установке chromium | в системе libffi 3.4 | не ставить chromium из EPEL, ставить Chrome (5.1) |
-| Chrome под root: `Running as root without --no-sandbox is not supported` | песочница не даёт работать от root | запускать под обычным пользователем либо `--no-sandbox` (5.4) |
+| Chrome не запускается: `Running as root without --no-sandbox is not supported` | сессия под root | работать под обычным пользователем либо `--no-sandbox` (5.4.1) |
+| Chrome не запускается: `error while loading shared libraries` | не хватает библиотек в minimal-установке | `ldd /opt/google/chrome/chrome \| grep "not found"`, доставить (5.4.2) |
+| Chrome не запускается: `Failed to connect to the bus` | в сессии нет D-Bus | `dbus-launch google-chrome-stable` (5.4.3) |
 | Chrome открывается, но камеры/видео — чёрный экран | поток в H.264, а в Chromium из EPEL его нет | поставить Chrome (5.1–5.3) |
-| Chrome в xrdp падает / артефакты | у `xorgxrdp` нет аппаратного GL | `--disable-gpu` в ярлыке (5.4) |
+| Chrome в xrdp падает / артефакты / чёрное окно | у `xorgxrdp` нет аппаратного GL | `--disable-gpu` (5.4.4) |
+| Chrome падает на тяжёлых страницах, `Failed to map ... /dev/shm` | мало `/dev/shm` | `--disable-dev-shm-usage` (5.4.5) |
+| `The profile appears to be in use by another Chrome process` | залипший `SingletonLock` | удалить `~/.config/google-chrome/Singleton*` (5.4.6) |
 | LibreOffice не запускается, `GLIBC_2.33 not found` | взята ветка 26.x | ставить 25.8.x (6.1) |
 | LibreOffice «висит» при первом запуске | модальный мастер «Добро пожаловать» | нажать «Вперёд» (6.6) |
 | LibreOffice тормозит/артефакты | нет аппаратного GL у xorgxrdp | расширение `zz-aelita-defaults` (6.5) |
@@ -958,7 +1130,7 @@ LibreOffice 25.8.7.3 (45 пакетов в /opt/libreoffice25.8)
 - [ ] Xfce + набор goodies + `mousepad`/`gedit` + `liberation-fonts`
 - [ ] ключ Google импортирован, `google-chrome-stable` установлен (подпись `rpm -Kv` — OK),
       H.264 в нём есть (`probe.html` → `avc1=true`)
-- [ ] в xrdp Chrome запускается (под обычным пользователем либо с `--no-sandbox`), камеры видны
+- [ ] в xrdp Chrome запускается (**не под root**; если под root — `--no-sandbox`, 5.4.1), камеры видны
 - [ ] LibreOffice 25.8.7 + `_langpack_ru`, подписи `.asc` проверены
 - [ ] расширение `zz-aelita-defaults` создано, значения прочитаны через UNO
 - [ ] xrdp + xorgxrdp, `startwm-bash.sh`, абсолютный `DefaultWindowManager`
