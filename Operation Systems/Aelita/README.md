@@ -15,8 +15,8 @@
 `rpm 4.14.3`, `dnf 4.7`. Отсюда два следствия для всей дальнейшей работы:
 
 1. Всё, что требует `glibc` новее 2.28, работать не будет (например, LibreOffice 26.x).
-2. Пакеты собираются под EL8, но набор библиотек в системе не идентичен RHEL 8 — иногда
-   попадаются несовпадения (см. раздел 5, chromium).
+2. Пакеты собираются под EL8, но набор библиотек в системе не идентичен RHEL 8 — именно
+   так ломается chromium из EPEL, которому нужен `libffi.so.6` (см. 5.1).
 
 **Минимальная установка — это действительно минимум:**
 
@@ -32,10 +32,10 @@
 | Ресурс | Назначение |
 |---|---|
 | `http://repo.aelita.itgryphon.ru/repo/` | российское зеркало репозитория Aelita |
-| `https://mirror.yandex.ru/epel/8/Everything/x86_64/` | EPEL 8 (Xfce, xrdp, chromium) |
+| `https://mirror.yandex.ru/epel/8/Everything/x86_64/` | EPEL 8 (Xfce, xrdp) |
+| `https://dl.google.com` | Google Chrome (rpm + ключ подписи) |
 | `https://download.documentfoundation.org` | архивы LibreOffice |
 | `https://keyserver.ubuntu.com` | ключ подписи TDF |
-| `https://repo.almalinux.org` | одна библиотека для chromium |
 
 ---
 
@@ -240,8 +240,8 @@ dnf -y install mousepad gedit liberation-fonts
 * `liberation-fonts` — метрические аналоги Arial/Times/Courier, без них в `.docx` плывёт вёрстка.
 
 Браузера в репозиториях Aelita нет вообще (`firefox`, `chromium-browser`, `google-chrome`,
-`yandex-browser` — ноль совпадений). Единственный вариант из репозитория — chromium из EPEL,
-но он ставится с обходом, см. раздел 5.
+`yandex-browser` — ноль совпадений). Chromium из EPEL ставится с обходом зависимостей и при
+этом не умеет H.264/HEVC, поэтому браузер берём у Google — см. раздел 5.
 
 ---
 
@@ -264,73 +264,194 @@ ls -l /usr/bin/startxfce4
 
 ---
 
-## 5. Chromium: штатная установка ломается на `libffi.so.6`
+## 5. Браузер: Google Chrome
+
+Ни `firefox`, ни `google-chrome`, ни `yandex-browser` в репозиториях Aelita нет (см. 3.3).
+Chromium из EPEL ставится, но для видео непригоден, поэтому берём официальный RPM от Google.
+
+### 5.1. Почему не Chromium из EPEL
+
+Причин две, и вторая важнее первой.
+
+**Обход зависимостей.** Сборка EPEL рассчитана на `libffi 3.1` из RHEL 8 (`libffi.so.6`),
+в Aelita — `libffi 3.4.2` (`libffi.so.8`):
 
 ```
 Problem: nothing provides libffi.so.6()(64bit) needed by chromium-133.0.6943.141-1.el8.x86_64
 ```
 
-Причина: сборка EPEL рассчитана на `libffi 3.1` из RHEL 8 (`libffi.so.6`), а в Aelita
-`libffi 3.4.2` (`libffi.so.8`). Совместимого пакета в репозиториях нет.
+Лечится подкладыванием `libffi.so.6` в `/opt` и установкой через `rpm --nodeps`. Работает,
+но библиотека живёт вне пакетного менеджера, и помнить про неё придётся при каждом
+обновлении.
 
-Решение — положить рядом только саму библиотеку (soname другой, конфликта с системной нет)
-и поставить chromium без проверки именно этой зависимости.
+**Нет H.264 и HEVC.** Это важнее. Chromium из Fedora/EPEL собран со «свободным» набором
+кодеков. Проверить это можно в самом браузере, без графики: headless-страница опрашивает
+`MediaSource`.
 
-### 5.1. Совместимая библиотека
+`/tmp/probe.html`:
 
-```bash
-curl -fsS -O https://repo.almalinux.org/almalinux/8/BaseOS/x86_64/os/Packages/libffi-3.1-24.el8.x86_64.rpm
-sha256sum libffi-3.1-24.el8.x86_64.rpm
+```html
+<body><script>
+document.body.textContent = [
+ "avc1 (H.264)=" + MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"'),
+ "hvc1 (HEVC)="  + MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"'),
+ "vp8="          + MediaSource.isTypeSupported('video/webm; codecs="vp8"'),
+ "vp9="          + MediaSource.isTypeSupported('video/webm; codecs="vp9"')
+].join("  ");
+</script></body>
 ```
 
-Сверьте sha256 со значением из метаданных AlmaLinux (`BaseOS/…/repodata/*primary.xml.gz`,
-пакет `libffi`, arch `x86_64`) — на проверенной системе совпало
-`baa22d471c0ab0d17ab1ba372a262df3c50d6430af4259a4065dfccf0529324a`.
-
 ```bash
-mkdir -p /tmp/ffi && cd /tmp/ffi
-rpm2cpio /root/libffi-3.1-24.el8.x86_64.rpm | cpio -idm --quiet
-
-mkdir -p /opt/compat-libffi6/lib64
-install -m 755 usr/lib64/libffi.so.6.0.2 /opt/compat-libffi6/lib64/libffi.so.6.0.2
-ln -sf libffi.so.6.0.2 /opt/compat-libffi6/lib64/libffi.so.6
-echo "/opt/compat-libffi6/lib64" > /etc/ld.so.conf.d/compat-libffi6.conf
-ldconfig
+chromium-browser --headless=new --no-sandbox --disable-gpu \
+  --user-data-dir=/tmp/cr-probe --virtual-time-budget=4000 \
+  --dump-dom file:///tmp/probe.html 2>/dev/null | grep -o 'avc1.*'
 ```
 
-> Внутри пакета имя файла — `libffi.so.6.0.2` (не `6.0.1`); проверяйте `ls usr/lib64/`.
+Результат на `chromium-133.0.6943.141-1.el8`:
 
-### 5.2. Сам chromium
+```
+avc1 (H.264)=false  hvc1 (HEVC)=false  vp8=true  vp9=true
+```
+
+Практический смысл: веб-интерфейсы видеонаблюдения, видеоконференции и часть видеосайтов
+показывают чёрный экран вместо картинки. Камеры почти всегда отдают H.264 — в этом браузере
+их не увидеть.
+
+> **Типичная ошибка при диагностике.** Совет «поставить `libavcodec-freeworld` / `ffmpeg-libs`,
+> и кодеки появятся» к Chromium не относится: его ffmpeg вкомпилирован в бинарник
+> статически. В `/usr/lib64/chromium-browser/` нет `libffmpeg.so`,
+> `rpm -q --requires chromium` не упоминает ffmpeg, `ldd /usr/bin/chromium-browser` не
+> показывает `libavcodec` — системные кодеки на него не влияют. Пакета `libavcodec-freeworld`
+> в Aelita (EL8) вообще нет, это имя из Fedora/RPM Fusion.
+
+Google Chrome, в отличие от Chromium, несёт собственный ffmpeg с H.264, AAC и HEVC.
+
+### 5.2. Установка
+
+Chrome требует glibc 2.27+ (официально — Ubuntu 18.04+, Debian 10+), в Aelita `glibc 2.28`.
+Остальные зависимости — gtk3, `libgbm`, `libatk`, `libat-spi2-atk`, `cups-libs`,
+`liberation-fonts` и т.п. — есть в `aelita-ru`/`epel8-ru`, dnf подтянет их сам.
+
+Ключ подписи Google:
+
+```bash
+curl -fsS -o /etc/pki/rpm-gpg/RPM-GPG-KEY-google https://dl.google.com/linux/linux_signing_key.pub
+rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-google
+```
+
+Ожидаемый ключ — `Google Inc. (Linux Packages Signing Authority)
+<linux-packages-keymaster@google.com>`, отпечаток
+`EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796` (key ID `d38b4796`). Убедиться, что он
+импортировался:
+
+```bash
+rpm -qa "gpg-pubkey*"
+```
+
+```
+gpg-pubkey-34b17bc3-64c74e6b      # ключ CYSOFT, Aelita
+gpg-pubkey-d38b4796-...           # ключ Google
+```
+
+Ставим:
 
 ```bash
 cd /root
-dnf -y download chromium
-CR=$(ls /root/chromium-*.rpm | head -1)
-
-DEPS=$(rpm -qp --requires "$CR" \
-  | grep -vE '^(rpmlib|/bin/sh)' | grep -v '^libffi\.so\.6' \
-  | awk '{print $1}' | sort -u | tr '\n' ' ')
-dnf -y install $DEPS
-
-rpm -ivh --nodeps "$CR"
+curl -fsSL -O https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm
+rpm -Kv google-chrome-stable_current_x86_64.rpm
+dnf -y install ./google-chrome-stable_current_x86_64.rpm
 ```
 
-Проверка:
+`rpm -Kv` должен ответить:
+
+```
+Header V4 RSA/SHA256 Signature, key ID d38b4796: OK
+```
+
+Пакет сам создаёт `/etc/yum.repos.d/google-chrome.repo` с `gpgcheck=1`, поэтому дальше
+обновления идут штатно, без ручного скачивания:
 
 ```bash
-chromium-browser --version
-ldd /usr/bin/chromium-browser | grep "not found" || echo "все библиотеки найдены"
+dnf -y upgrade google-chrome-stable
+```
+
+### 5.3. Проверка
+
+```bash
+google-chrome-stable --version
+ldd /opt/google/chrome/chrome | grep "not found" || echo "все библиотеки найдены"
 ```
 
 ```
-Chromium 133.0.6943.141 Fedora Project
+Google Chrome 157.0.8103.38     # на момент проверки
 ```
 
-> Ограничение решения: `rpm --nodeps` обходит только `libffi`, все остальные 111 зависимостей
-> ставятся штатно, с проверкой подписи. Библиотека `libffi.so.6` лежит вне пакетного менеджера —
-> при обновлении chromium переустановка не требуется, но помнить про неё нужно.
+Проверка кодеков — тем же `probe.html` из 5.1, только другим бинарником:
 
----
+```bash
+google-chrome-stable --headless=new --no-sandbox --disable-gpu \
+  --user-data-dir=/tmp/cr-probe --virtual-time-budget=4000 \
+  --dump-dom file:///tmp/probe.html 2>/dev/null | grep -o 'avc1.*'
+```
+
+Ожидаемо `avc1 (H.264)=true` — после этого камеры в веб-интерфейсе показываются.
+
+HEVC (`hvc1`) может остаться `false`: на Linux Chrome декодирует его только аппаратно, через
+VA-API, а в сессии xrdp аппаратного декодера нет. Для камер это обычно не проблема — почти
+все регистраторы умеют отдавать H.264 (в настройках это часто «второй поток» / sub-stream).
+
+### 5.4. `--no-sandbox` и запуск в сессии xrdp
+
+**Chrome не стартует под root.** В stderr (и в логе) при запуске:
+
+```
+[FATAL:zygote_host_impl_linux.cc(90)] Running as root without --no-sandbox is not supported.
+```
+
+Правильное решение — работать под обычным пользователем (`test1`/`test2`); установка от root
+этому не мешает, Chrome ставится в `/opt/google/chrome`. Быстрое — добавить флаг:
+
+```bash
+google-chrome-stable --no-sandbox
+```
+
+> `--no-sandbox` отключает песочницу рендерера. Под root это значит, что любая уязвимость
+> в открытой странице даёт выполнение кода с правами root. Для стенда, где браузер ходит
+> только в известный веб-интерфейс, приемлемо; как постоянная практика на рабочей машине —
+> нет.
+
+Чтобы флаг работал и при запуске с иконки, правим пользовательскую копию ярлыка: системный
+`/usr/share/applications/google-chrome.desktop` перезапишется при обновлении пакета.
+
+```bash
+mkdir -p ~/.local/share/applications
+cp /usr/share/applications/google-chrome.desktop ~/.local/share/applications/
+sed -i 's#^Exec=/usr/bin/google-chrome-stable#Exec=/usr/bin/google-chrome-stable --no-sandbox#' \
+  ~/.local/share/applications/google-chrome.desktop
+update-desktop-database ~/.local/share/applications 2>/dev/null
+grep '^Exec=' ~/.local/share/applications/google-chrome.desktop
+```
+
+Все строки `Exec=` должны начинаться с `/usr/bin/google-chrome-stable --no-sandbox`.
+
+**Чёрное окно или падения.** У `xorgxrdp` нет аппаратного OpenGL (см. 6.5) — добавьте
+`--disable-gpu` туда же:
+
+```
+Exec=/usr/bin/google-chrome-stable --no-sandbox --disable-gpu %U
+```
+
+**С иконки ничего не происходит, сообщений нет.** Запустите из `xfce4-terminal` в той же
+xrdp-сессии: текст ошибки (в том числе про root и песочницу) уходит в stderr, а из ярлыка
+его не видно.
+
+### 5.5. Откат
+
+```bash
+dnf -y remove google-chrome-stable
+rm -rf /opt/google/chrome ~/.config/google-chrome
+rpm -e "$(rpm -q gpg-pubkey | grep d38b4796)"
+```
 
 ## 6. LibreOffice 25.8.7
 
@@ -785,7 +906,10 @@ library versions: OpenSSL 1.1.1wa  16 Nov 2023, LZO 2.08
 | `User does not exist, or could not be authenticated` | mstsc шлёт скан-коды, xrdp декодирует по US-раскладке; с русской раскладкой `@` и `#` превращаются в `"` и `№` | переключить раскладку на EN (`Win+Space`) перед вводом; пароль на сервере при этом верный |
 | `PAM: The account is locked due to 3 failed logins` | `faillock deny=3` | `faillock --user <u> --reset`; ослабить, см. 8.2 |
 | Сессия открывается в GNOME, а не в Xfce | `DefaultWindowManager` относительный, взят из `/usr/libexec/xrdp/` | прописать абсолютный путь (7.2) |
-| `nothing provides libffi.so.6` при установке chromium | в системе libffi 3.4 | раздел 5 |
+| `nothing provides libffi.so.6` при установке chromium | в системе libffi 3.4 | не ставить chromium из EPEL, ставить Chrome (5.1) |
+| Chrome под root: `Running as root without --no-sandbox is not supported` | песочница не даёт работать от root | запускать под обычным пользователем либо `--no-sandbox` (5.4) |
+| Chrome открывается, но камеры/видео — чёрный экран | поток в H.264, а в Chromium из EPEL его нет | поставить Chrome (5.1–5.3) |
+| Chrome в xrdp падает / артефакты | у `xorgxrdp` нет аппаратного GL | `--disable-gpu` в ярлыке (5.4) |
 | LibreOffice не запускается, `GLIBC_2.33 not found` | взята ветка 26.x | ставить 25.8.x (6.1) |
 | LibreOffice «висит» при первом запуске | модальный мастер «Добро пожаловать» | нажать «Вперёд» (6.6) |
 | LibreOffice тормозит/артефакты | нет аппаратного GL у xorgxrdp | расширение `zz-aelita-defaults` (6.5) |
@@ -802,11 +926,12 @@ library versions: OpenSSL 1.1.1wa  16 Nov 2023, LZO 2.08
 /etc/yum.repos.d/everything.repo.disabled      отключённый китайский репозиторий
 /etc/pki/rpm-gpg/RPM-GPG-KEY-Aelita            ключ CYSOFT (expired 2025-07-30)
 /etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-8            ключ EPEL 8
+/etc/pki/rpm-gpg/RPM-GPG-KEY-google            ключ Google (Linux Packages Signing Authority)
+/etc/yum.repos.d/google-chrome.repo            репозиторий Chrome (создаётся пакетом, gpgcheck=1)
 /root/aelita-backup/                           бэкапы everything.repo и password-auth
 /etc/xrdp/startwm-bash.sh                      системная сессия Xfce
 /etc/xrdp/sesman.ini                           DefaultWindowManager (абсолютный путь)
-/opt/compat-libffi6/lib64/libffi.so.6*         совместимая библиотека для chromium
-/etc/ld.so.conf.d/compat-libffi6.conf          путь к ней
+/opt/google/chrome/                            Google Chrome
 /opt/libreoffice25.8/                          LibreOffice 25.8.7
 /opt/libreoffice25.8/share/extensions/zz-aelita-defaults/   общесистемные настройки LO
 /root/lo/                                      архивы LibreOffice (можно удалить)
@@ -818,7 +943,7 @@ library versions: OpenSSL 1.1.1wa  16 Nov 2023, LZO 2.08
 ```
 xrdp-0.10.6.1-3.el8            xorgxrdp-0.10.5-1.el8
 xfce4-session-4.16.0-4.el8     Thunar-4.16.8-1.el8
-chromium-133.0.6943.141-1.el8  mousepad-0.5.6-1.el8   gedit-40.0-8.cq24
+google-chrome-stable-157.0.8103.38  mousepad-0.5.6-1.el8   gedit-40.0-8.cq24
 LibreOffice 25.8.7.3 (45 пакетов в /opt/libreoffice25.8)
 ```
 
@@ -831,7 +956,9 @@ LibreOffice 25.8.7.3 (45 пакетов в /opt/libreoffice25.8)
 - [ ] ключ CYSOFT сверен с `cqos-gpg-keys` и импортирован
 - [ ] `aelita-ru.repo` + `epel8-ru.repo`, `gpgcheck=1`, `dnf makecache` без ошибок
 - [ ] Xfce + набор goodies + `mousepad`/`gedit` + `liberation-fonts`
-- [ ] chromium установлен через `libffi.so.6`-обход, `--version` отвечает
+- [ ] ключ Google импортирован, `google-chrome-stable` установлен (подпись `rpm -Kv` — OK),
+      H.264 в нём есть (`probe.html` → `avc1=true`)
+- [ ] в xrdp Chrome запускается (под обычным пользователем либо с `--no-sandbox`), камеры видны
 - [ ] LibreOffice 25.8.7 + `_langpack_ru`, подписи `.asc` проверены
 - [ ] расширение `zz-aelita-defaults` создано, значения прочитаны через UNO
 - [ ] xrdp + xorgxrdp, `startwm-bash.sh`, абсолютный `DefaultWindowManager`
