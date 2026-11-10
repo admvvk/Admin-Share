@@ -37,6 +37,10 @@ EOF
 die() { echo "cam-one: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
+  # поддержка формы --опция=значение
+  if [[ "$1" == --*=* ]]; then
+    set -- "${1%%=*}" "${1#*=}" "${@:2}"
+  fi
   case "$1" in
     -s|--size)       SIZE=${2:-}; shift 2 || die "нужен размер WxH" ;;
     -t|--transport)  TRANSPORT=${2:-}; shift 2 || die "нужен транспорт tcp|udp" ;;
