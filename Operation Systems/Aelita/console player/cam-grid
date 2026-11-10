@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+# cam-grid — сетка RTSP-камер для X11/xrdp
+# Зависимости: ffmpeg (ffmpeg, ffprobe), xrandr (для авто-размера экрана)
+# Конфиг: /etc/cam-grid.conf (формат: имя|rtsp_url[|транспорт])
+set -u
+
+CONF=${CAM_GRID_CONF:-/etc/cam-grid.conf}
+FPS=15
+COLS=""
+MODE=mosaic
+ONE=""
+FULLSCREEN=0
+BORDERLESS=1
+LABELS=1
+SCREEN=""
+FONT=""
+TITLE="CAM grid"
+
+FONT_CANDIDATES=(
+  /usr/share/fonts/dejavu/DejaVuSans.ttf
+  /usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf
+)
+
+die() { echo "cam-grid: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+cam-grid — сетка RTSP-камер (один X-окно через SDL2, без GPU)
+
+Использование:
+  cam-grid                    сетка всех камер из конфига
+  cam-grid -o 2               одна камера по номеру (или по имени) на весь экран
+  cam-grid -o rtsp://...      одна камера по прямой ссылке
+  cam-grid --check            проверить все камеры (ffprobe), ничего не показывать
+  cam-grid --list             показать список камер из конфига
+
+Опции:
+  -c, --conf ФАЙЛ   конфиг (по умолчанию /etc/cam-grid.conf, env CAM_GRID_CONF)
+  -f, --fps N       частота кадров сетки, по умолчанию 15 (меньше = легче CPU)
+      --cols N      число колонок (по умолчанию ~квадрат: 2 для 2-4 камер, 3 для 5-9)
+  -o, --one K       одна камера: номер из --list, имя или URL
+      --fullscreen  полноэкранный режим
+      --decorated   обычное окно с рамкой (по умолчанию окно без рамки на весь экран)
+      --no-labels   без подписей камер
+      --size WxH    принудительный размер окна/экрана (по умолчанию из xrandr)
+  -h, --help        эта справка
+
+Формат конфига (одна камера в строке, поля через |):
+  имя|url[|транспорт[|доп.опции_ffmpeg]]
+    транспорт — tcp (по умолчанию) или udp, только для rtsp://
+    доп.опции — необязательные ключи входа, например "-tls_verify 0"
+  Вход|rtsp://user:pass@192.168.1.64:554/Streaming/Channels/101
+  Двор|rtsp://user:pass@192.168.1.65:554/Streaming/Channels/102|udp
+  Склад|rtsps://user:pass@192.168.1.66:554/live||-tls_verify 0
+
+Выход из сетки: клавиша q в окне или Ctrl+C в терминале.
+EOF
+}
+
+trim() {
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  printf '%s' "$s"
+}
+
+mask_url() {
+  local u=$1
+  printf '%s' "$u" | sed -E 's#(//[^:/@]+):[^@/]*@#\1:***@#'
+}
+
+escape_drawtext() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\'/\\\'}
+  s=${s//:/\\:}
+  s=${s//%/\\%}
+  printf '%s' "$s"
+}
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "не найдена команда $1"; }
+
+load_conf() {
+  [ -r "$CONF" ] || die "не читается конфиг: $CONF"
+  NAMES=(); URLS=(); TRANS=(); EXTRA=()
+  local line name url tr
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(trim "$line")
+    case "$line" in ''|'#'*) continue ;; esac
+    IFS='|' read -r name url tr extra <<<"$line"
+    name=$(trim "$name"); url=$(trim "$url"); tr=$(trim "$tr"); extra=$(trim "$extra")
+    [ -n "$url" ] || continue
+    [ -n "$name" ] || name="CAM$(( ${#URLS[@]} + 1 ))"
+    [ -n "$tr" ] || tr=tcp
+    NAMES+=("$name"); URLS+=("$url"); TRANS+=("$tr"); EXTRA+=("$extra")
+  done <"$CONF"
+}
+
+detect_screen() {
+  local s=""
+  if [ -n "${DISPLAY:-}" ] && command -v xrandr >/dev/null 2>&1; then
+    s=$(xrandr --current 2>/dev/null | awk '/\*/ {print $1; exit}')
+  fi
+  case "$s" in [0-9]*x[0-9]*) printf '%s' "$s" ;; *) printf '1920x1080' ;; esac
+}
+
+panel_top_px() {
+  command -v xfconf-query >/dev/null 2>&1 || { echo 0; return 0; }
+  local pos sz
+  pos=$(xfconf-query -c xfce4-panel -p /panels/panel-1/position 2>/dev/null) || { echo 0; return 0; }
+  sz=$(xfconf-query -c xfce4-panel -p /panels/panel-1/size 2>/dev/null) || { echo 0; return 0; }
+  case "$pos" in p=6*) printf '%s' "${sz:-0}" ;; *) echo 0 ;; esac
+}
+
+even() { local v=$1; [ $((v % 2)) -eq 0 ] || v=$((v - 1)); printf '%s' "$v"; }
+
+pick_font() {
+  local f
+  for f in "${FONT_CANDIDATES[@]}"; do
+    [ -r "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+# --- разбор аргументов ---
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c|--conf)     CONF=${2:-}; shift 2 || die "нужен путь к конфигу" ;;
+    -f|--fps)      FPS=${2:-}; shift 2 || die "нужно число fps" ;;
+    --cols)        COLS=${2:-}; shift 2 || die "нужно число колонок" ;;
+    -o|--one)      MODE=one; ONE=${2:-}; shift 2 || die "нужен номер/имя/URL камеры" ;;
+    --fullscreen)  FULLSCREEN=1; shift ;;
+    --decorated)   BORDERLESS=0; shift ;;
+    --no-labels)   LABELS=0; shift ;;
+    --size)        SCREEN=${2:-}; shift 2 || die "нужен размер WxH" ;;
+    -l|--list)     MODE=list; shift ;;
+    --check)       MODE=check; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             die "неизвестный аргумент: $1 (см. --help)" ;;
+  esac
+done
+
+need_cmd ffmpeg
+[[ "$FPS" =~ ^[0-9]+$ ]] && [ "$FPS" -ge 1 ] || die "некорректный fps: $FPS"
+
+if [ "$MODE" != one ] || [[ "$ONE" != *'://'* ]]; then
+  load_conf
+fi
+
+case "$MODE" in
+  list)
+    if [ ${#URLS[@]} -eq 0 ]; then
+      echo "cam-grid: в конфиге нет ни одной камеры: $CONF" >&2
+      exit 0
+    fi
+    i=1
+    for k in "${!URLS[@]}"; do
+      printf '%2d. %-20s %s (%s)\n' "$i" "${NAMES[$k]}" "$(mask_url "${URLS[$k]}")" "${TRANS[$k]}"
+      i=$((i + 1))
+    done
+    exit 0
+    ;;
+
+  check)
+    if [ ${#URLS[@]} -eq 0 ]; then
+      echo "cam-grid: в конфиге нет ни одной камеры: $CONF" >&2
+      exit 1
+    fi
+    fail=0
+    for k in "${!URLS[@]}"; do
+      printf '%-20s ' "${NAMES[$k]}"
+      errf=$(mktemp /tmp/cam-grid-probe.XXXXXX)
+      ropts=()
+      case "${URLS[$k]}" in
+        rtsp://*|rtsps://*) ropts+=(-rtsp_transport "${TRANS[$k]}") ;;
+      esac
+      if [ -n "${EXTRA[$k]:-}" ]; then
+        read -r -a _x <<<"${EXTRA[$k]}"
+        skip=0
+        for _o in "${_x[@]}"; do
+          if [ $skip -eq 1 ]; then skip=0; continue; fi
+          case "$_o" in
+            -re) continue ;;
+            -stream_loop) skip=1; continue ;;
+          esac
+          ropts+=("$_o")
+        done
+      fi
+      out=$(timeout 15 ffprobe -v error ${ropts[@]+"${ropts[@]}"} \
+              -select_streams v:0 -show_entries stream=codec_name,width,height,avg_frame_rate \
+              -of csv=p=0 "${URLS[$k]}" 2>"$errf")
+      rc=$?
+      if [ $rc -eq 0 ] && [ -n "$out" ]; then
+        IFS=',' read -r codec cw ch rate <<<"$out"
+        printf 'OK    %sx%s %s %s fps\n' "$cw" "$ch" "$codec" "${rate%%/*}"
+      else
+        printf 'FAIL  %s\n' "$(tail -1 "$errf" 2>/dev/null)"
+        fail=$((fail + 1))
+      fi
+      rm -f "$errf"
+    done
+    exit $(( fail > 0 ? 1 : 0 ))
+    ;;
+esac
+
+[ -n "${DISPLAY:-}" ] || die "DISPLAY не задан (запускайте из графического сеанса)"
+
+# --- подготовка входа ---
+if [ "$MODE" = one ]; then
+  if [[ "$ONE" == *'://'* ]]; then
+    NAMES=(CAM); URLS=("$ONE"); TRANS=(tcp); EXTRA=("")
+  else
+    idx=""
+    if [[ "$ONE" =~ ^[0-9]+$ ]] && [ "$ONE" -ge 1 ] && [ "$ONE" -le ${#URLS[@]} ]; then
+      idx=$((ONE - 1))
+    else
+      for k in "${!NAMES[@]}"; do
+        [ "${NAMES[$k],,}" = "${ONE,,}" ] && { idx=$k; break; }
+      done
+    fi
+    [ -n "$idx" ] || die "камера не найдена: $ONE (список: cam-grid --list)"
+    NAMES=("${NAMES[$idx]}"); URLS=("${URLS[$idx]}"); TRANS=("${TRANS[$idx]}")
+    EXTRA=("${EXTRA[$idx]:-}")
+  fi
+fi
+
+n=${#URLS[@]}
+[ "$n" -gt 0 ] || die "в конфиге нет ни одной камеры: $CONF"
+[ -n "$SCREEN" ] || SCREEN=$(detect_screen)
+sw=${SCREEN%x*}; sh=${SCREEN#*x}
+[[ "$sw" =~ ^[0-9]+$ && "$sh" =~ ^[0-9]+$ ]] || die "некорректный размер: $SCREEN"
+
+if [ "$MODE" = mosaic ]; then
+  if [ -z "$COLS" ]; then
+    if   [ "$n" -le 1 ]; then COLS=1
+    elif [ "$n" -le 4 ]; then COLS=2
+    elif [ "$n" -le 9 ]; then COLS=3
+    else COLS=$(( (n + 3) / 4 ))
+    fi
+  fi
+  [[ "$COLS" =~ ^[0-9]+$ ]] && [ "$COLS" -ge 1 ] || die "некорректное число колонок: $COLS"
+  ROWS=$(( (n + COLS - 1) / COLS ))
+else
+  COLS=1; ROWS=1
+fi
+
+if [ "$FULLSCREEN" = 1 ]; then
+  PAD_TOP=0
+else
+  PAD_TOP=$(panel_top_px)
+  [[ "$PAD_TOP" =~ ^[0-9]+$ ]] || PAD_TOP=0
+  [ "$PAD_TOP" -lt "$sh" ] || PAD_TOP=0
+fi
+uh=$(( sh - PAD_TOP ))
+[ "$uh" -ge 100 ] || { uh=$sh; PAD_TOP=0; }
+
+tw=$(even $(( sw / COLS )))
+th=$(even $(( uh / ROWS )))
+
+if [ "$LABELS" = 1 ] && ! FONT=$(pick_font); then
+  LABELS=0
+fi
+
+# --- сборка filter_complex и команды ffmpeg ---
+args=(-hide_banner -loglevel warning -nostats)
+filters=()
+layout=""
+k=0
+while [ $k -lt "$n" ]; do
+  case "${URLS[$k]}" in
+    rtsp://*|rtsps://*) args+=(-rtsp_transport "${TRANS[$k]}") ;;
+  esac
+  if [ -n "${EXTRA[$k]:-}" ]; then
+    read -r -a _ex <<<"${EXTRA[$k]}"
+    args+=("${_ex[@]}")
+  fi
+  args+=(-fflags nobuffer -flags low_delay -thread_queue_size 512
+         -analyzeduration 1000000 -probesize 1000000 -i "${URLS[$k]}")
+  chain="[$k:v]fps=$FPS,scale=$tw:$th:force_original_aspect_ratio=decrease"
+  chain+=",pad=$tw:$th:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
+  if [ "$LABELS" = 1 ]; then
+    label=$(escape_drawtext "${NAMES[$k]}")
+    fs=$(( th / 18 )); [ "$fs" -ge 14 ] || fs=14; [ "$fs" -le 28 ] || fs=28
+    chain+=",drawtext=fontfile=$FONT:text='$label':x=10:y=10:fontsize=$fs"
+    chain+=":fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=6"
+  fi
+  chain+="[v$k]"
+  filters+=("$chain")
+  x=$(( (k % COLS) * tw )); y=$(( (k / COLS) * th ))
+  [ -z "$layout" ] && layout="${x}_${y}" || layout="${layout}|${x}_${y}"
+  k=$((k + 1))
+done
+
+if [ "$n" -gt 1 ]; then
+  stack=""
+  k=0; while [ $k -lt "$n" ]; do stack+="[v$k]"; k=$((k + 1)); done
+  filters+=("${stack}xstack=inputs=$n:layout=$layout[out]")
+  args+=(-filter_complex "$(IFS=';'; printf '%s' "${filters[*]}")" -map '[out]')
+else
+  args+=(-filter_complex "${filters[0]}" -map '[v0]')
+fi
+
+args+=(-an -f sdl2 -window_title "$TITLE" -window_size "${sw}x${uh}" -window_x 0 -window_y "$PAD_TOP")
+[ "$FULLSCREEN" = 1 ] && args+=(-window_fullscreen 1)
+[ "$BORDERLESS" = 1 ] && args+=(-window_borderless 1)
+args+=(-window_enable_quit 1 sdl2out)
+
+echo "cam-grid: камер $n, сетка ${COLS}x${ROWS}, тайл ${tw}x${th}, fps $FPS, экран ${sw}x${uh} (отступ сверху $PAD_TOP)" >&2
+exec ffmpeg "${args[@]}"
