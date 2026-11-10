@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# cam-player — показ одной камеры (RTSP/HTTP/HLS) в небольшом окне на X11/xrdp
+# Зависимости: ffmpeg (ffmpeg, ffprobe) из репозитория aelita-ru
+# Пример: cam-player rtsp://user:pass@192.168.0.71:554/Streaming/Channels/102
+set -u
+
+SIZE=640x360
+TRANSPORT=tcp
+FPS=""
+TITLE=""
+AUDIO=0
+CHECK=0
+FFARGS=""
+URL=""
+URLFILE=""
+
+usage() {
+  cat <<'EOF'
+cam-player — одна камера в отдельном окне (по умолчанию 640x360, не на весь экран)
+
+Использование:
+  cam-player rtsp://user:pass@IP:554/Streaming/Channels/102
+  cam-player --size 960x540 rtsp://...
+  cam-player --check rtsp://user:pass@IP:554/...
+  cam-player --transport udp "rtsp://IP:554/cam/realmonitor?channel=1&subtype=1"
+
+Параметры:
+  -s, --size WxH        размер окна, по умолчанию 640x360 (округляется до чётных)
+  -t, --transport Т     tcp (по умолчанию) или udp — только для rtsp(s)://
+  -f, --fps N           ограничить частоту кадров (меньше = легче CPU)
+      --title ТЕКСТ     заголовок окна (по умолчанию — URL с замаскированным паролем)
+      --audio           воспроизводить звук потока (по умолчанию выключен)
+      --ffmpeg-args "…" дополнительные ключи входа ffmpeg, например "-tls_verify 0"
+  -u, --url-file ФАЙЛ   взять ссылку из файла (права 0600) — чтобы пароль не был виден в ps
+  -c, --check           только проверить поток (ffprobe): кодек, разрешение, fps
+  -h, --help            эта справка
+
+Любую опцию можно писать как "--опция значение" и как "--опция=значение".
+Выход из окна: q или Ctrl+C в терминале.
+EOF
+}
+
+die() { echo "cam-player: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  # поддержка формы --опция=значение
+  if [[ "$1" == --*=* ]]; then
+    set -- "${1%%=*}" "${1#*=}" "${@:2}"
+  fi
+  case "$1" in
+    -s|--size)       SIZE=${2:-}; shift 2 || die "нужен размер WxH" ;;
+    -t|--transport)  TRANSPORT=${2:-}; shift 2 || die "нужен транспорт tcp|udp" ;;
+    -f|--fps)        FPS=${2:-}; shift 2 || die "нужно число fps" ;;
+    --title)         TITLE=${2:-}; shift 2 || die "нужен текст заголовка" ;;
+    --audio)         AUDIO=1; shift ;;
+    --ffmpeg-args)   FFARGS=${2:-}; shift 2 || die "нужна строка ключей ffmpeg" ;;
+    -u|--url-file)   URLFILE=${2:-}; shift 2 || die "нужен путь к файлу со ссылкой" ;;
+    -c|--check)      CHECK=1; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    -*)              die "неизвестная опция: $1 (см. --help)" ;;
+    *)
+      [ -z "$URL" ] || die "лишний аргумент: $1 (нужна одна ссылка на поток)"
+      URL=$1; shift ;;
+  esac
+done
+
+if [ -n "$URLFILE" ]; then
+  [ -z "$URL" ] || die "укажите либо ссылку, либо --url-file, но не оба"
+  [ -r "$URLFILE" ] || die "не читается файл со ссылкой: $URLFILE"
+  URL=$(grep -m1 -v '^[[:space:]]*#' "$URLFILE" | tr -d '\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+fi
+
+[ -n "$URL" ] || { usage >&2; die "не задана ссылка на поток"; }
+[[ "$URL" == *'://'* ]] || die "ожидается URL вида rtsp://…, получено: $URL"
+[[ "$SIZE" =~ ^[0-9]+x[0-9]+$ ]] || die "некорректный размер: $SIZE (нужно WxH, например 640x360)"
+[ -n "$FPS" ] && { [[ "$FPS" =~ ^[0-9]+$ ]] && [ "$FPS" -ge 1 ] || die "некорректный fps: $FPS"; }
+command -v ffmpeg >/dev/null 2>&1 || die "не найден ffmpeg (dnf -y install ffmpeg)"
+
+mask() { printf '%s' "$1" | sed -E 's#(//[^:/@]+):[^@/]*@#\1:***@#'; }
+
+# --- режим проверки: только ffprobe, окно не открывается ---
+if [ "$CHECK" = 1 ]; then
+  command -v ffprobe >/dev/null 2>&1 || die "не найден ffprobe (dnf -y install ffmpeg)"
+  ropts=()
+  case "$URL" in
+    rtsp://*|rtsps://*) ropts+=(-rtsp_transport "$TRANSPORT") ;;
+  esac
+  if [ -n "$FFARGS" ]; then
+    read -r -a _x <<<"$FFARGS"
+    skip=0
+    for _o in "${_x[@]}"; do
+      if [ "$skip" = 1 ]; then skip=0; continue; fi
+      case "$_o" in
+        -re) continue ;;
+        -stream_loop) skip=1; continue ;;
+      esac
+      ropts+=("$_o")
+    done
+  fi
+  errf=$(mktemp /tmp/cam-player-probe.XXXXXX)
+  out=$(timeout 20 ffprobe -v error ${ropts[@]+"${ropts[@]}"} \
+          -select_streams v:0 -show_entries stream=codec_name,width,height,avg_frame_rate \
+          -of csv=p=0 "$URL" 2>"$errf")
+  rc=$?
+  if [ $rc -eq 0 ] && [ -n "$out" ]; then
+    IFS=',' read -r codec cw ch rate <<<"$out"
+    printf 'OK    %sx%s %s %s fps   %s\n' "$cw" "$ch" "$codec" "${rate%%/*}" "$(mask "$URL")"
+    rm -f "$errf"; exit 0
+  fi
+  printf 'FAIL  %s\n' "$(tail -1 "$errf" 2>/dev/null)" >&2
+  rm -f "$errf"; exit 1
+fi
+
+[ -n "${DISPLAY:-}" ] || die "DISPLAY не задан (запускайте из графического сеанса)"
+
+w=${SIZE%x*}; h=${SIZE#*x}
+[ $((w % 2)) -eq 0 ] || w=$((w - 1))
+[ $((h % 2)) -eq 0 ] || h=$((h - 1))
+SIZE="${w}x${h}"
+
+if [ -z "$TITLE" ]; then
+  TITLE="cam-player — $(mask "$URL")"
+  [ ${#TITLE} -gt 90 ] && TITLE="${TITLE:0:87}…"
+fi
+
+filter="scale=$w:$h:force_original_aspect_ratio=decrease,pad=$w:$h:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
+[ -n "$FPS" ] && filter="fps=$FPS,$filter"
+
+args=(-hide_banner -loglevel warning -nostats
+      -fflags nobuffer -flags low_delay -thread_queue_size 512
+      -analyzeduration 1000000 -probesize 1000000)
+
+case "$URL" in
+  rtsp://*|rtsps://*) args+=(-rtsp_transport "$TRANSPORT") ;;
+esac
+
+if [ -n "$FFARGS" ]; then
+  read -r -a _extra <<<"$FFARGS"
+  args+=("${_extra[@]}")
+fi
+
+args+=(-i "$URL" -vf "$filter")
+[ "$AUDIO" = 1 ] || args+=(-an)
+args+=(-f sdl2 -window_title "$TITLE" -window_size "$SIZE" -window_borderless 0 -window_enable_quit 1 sdl2out)
+
+echo "cam-player: $SIZE, $(mask "$URL")" >&2
+exec ffmpeg "${args[@]}"
