@@ -13,7 +13,8 @@ Xfce 4.16, реальная сессия 2560×1440.
 
 | Файл в пакете | Куда ставится на машине | Назначение |
 |---|---|---|
-| `cam-grid` | `/usr/local/bin/cam-grid` | сам лаунчер (bash) |
+| `cam-grid` | `/usr/local/bin/cam-grid` | сетка из всех камер конфига (bash) |
+| `cam-one` | `/usr/local/bin/cam-one` | одна камера в окне 640×360, ссылка передаётся аргументом |
 | — | `/etc/cam-grid.conf` | список камер (создаётся при внедрении) |
 | — | `/usr/share/applications/cam-grid.desktop` | пункт меню «Камеры (сетка)» |
 
@@ -61,7 +62,8 @@ ffmpeg -hide_banner -decoders 2>/dev/null | grep -E ' (h264|hevc|mjpeg) '
 
 ```bash
 install -m 0755 cam-grid /usr/local/bin/cam-grid
-bash -n /usr/local/bin/cam-grid && echo "syntax OK"
+install -m 0755 cam-one  /usr/local/bin/cam-one
+bash -n /usr/local/bin/cam-grid && bash -n /usr/local/bin/cam-one && echo "syntax OK"
 ```
 
 `/usr/local/bin` есть в `PATH` интерактивных сессий Xfce (проверено). Для `sudo`/`su`
@@ -169,9 +171,34 @@ cam-grid -h          # все опции
 
 Выход из сетки: клавиша `q` в окне или `Ctrl+C` в терминале.
 
+### 4.1. Одна камера в отдельном окне: `cam-one`
+
+Когда нужна не сетка, а быстро посмотреть один поток, удобнее второй скрипт: ссылка
+передаётся прямо в консоли, окно небольшое (640×360 по умолчанию), не на весь экран.
+
+```bash
+cam-one rtsp://user:pass@192.168.0.71:554/Streaming/Channels/102
+cam-one --transport udp "rtsp://user:pass@192.168.0.72:554/cam/realmonitor?channel=1&subtype=1"
+cam-one --size 960x540 rtsp://user:pass@192.168.0.73:554/live
+cam-one --ffmpeg-args "-tls_verify 0" rtsps://user:pass@192.168.0.74:554/live
+```
+
+| Опция | Что делает |
+|---|---|
+| `-s, --size WxH` | размер окна, по умолчанию `640x360` |
+| `-t, --transport T` | `tcp` (по умолчанию) или `udp` — только для `rtsp(s)://` |
+| `-f, --fps N` | ограничить частоту кадров (меньше нагрузка) |
+| `--title ТЕКСТ` | заголовок окна (по умолчанию — URL с замаскированным паролем) |
+| `--audio` | включить звук потока (по умолчанию выключен) |
+| `--ffmpeg-args "…"` | доп. ключи входа ffmpeg (например `-tls_verify 0`) |
+
+Особенности: окно **с рамкой** и заданного размера, `q` в окне или `Ctrl+C` в терминале —
+выход; пропорции сохраняются (по бокам чёрные поля), для рендера используется тот же
+SDL2-вывод, что и в сетке. Потребление на поток 720p — ~10 % одного ядра.
+
 ---
 
-## 5. Опции
+## 5. Опции `cam-grid`
 
 | Опция | Что делает |
 |---|---|
@@ -240,6 +267,7 @@ ffplay  -rtsp_transport tcp -fflags nobuffer -flags low_delay -framedrop \
 ```bash
 pkill -x ffmpeg                     # если сетка запущена
 rm -f /usr/local/bin/cam-grid \
+      /usr/local/bin/cam-one \
       /etc/cam-grid.conf \
       /usr/share/applications/cam-grid.desktop \
       ~/.config/autostart/cam-grid.desktop
@@ -286,6 +314,7 @@ cam-grid -c /opt/camlab/cameras.conf            # сетка 3x2 (5 камер)
 cam-grid -c /opt/camlab/cameras.conf -f 10      # то же, легче по CPU
 cam-grid -c /opt/camlab/cameras.conf -o 5       # только HEVC-камера
 cam-grid -c /opt/camlab/cameras.conf --check    # проверить все 5 потоков
+cam-one rtsp://127.0.0.1:8554/cam5              # одна камера в окне 640x360
 ```
 
 `--check` на стенде даёт:
@@ -338,7 +367,7 @@ systemctl daemon-reload
 
 - [ ] `dnf -y install ffmpeg`, `ffmpeg -version` отвечает
 - [ ] в `ffmpeg -demuxers` есть `rtsp`, в `-decoders` — `h264`/`hevc`
-- [ ] `cam-grid` установлен в `/usr/local/bin` с правами `0755`, `bash -n` проходит
+- [ ] `cam-grid` и `cam-one` установлены в `/usr/local/bin` с правами `0755`, `bash -n` проходит
 - [ ] `/etc/cam-grid.conf` создан, пароли закрыты (`root:root 0640`, при необходимости `camview`)
 - [ ] `cam-grid --list` показывает все камеры, пароли замаскированы
 - [ ] `cam-grid --check` — все камеры `OK`, кодеки H.264 (при HEVC/1080p — субпоток)
