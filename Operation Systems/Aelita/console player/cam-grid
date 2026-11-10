@@ -294,7 +294,15 @@ done
 if [ "$n" -gt 1 ]; then
   stack=""
   k=0; while [ $k -lt "$n" ]; do stack+="[v$k]"; k=$((k + 1)); done
-  filters+=("${stack}xstack=inputs=$n:layout=$layout[out]")
+  slots=$(( COLS * ROWS ))
+  if [ "$slots" -gt "$n" ]; then
+    # пустые ячейки последнего ряда ffmpeg 4.2 оставляет «зелёными» (нулевой YUV) — закрашиваем чёрным
+    gx=$(( (n % COLS) * tw )); gy=$(( (n / COLS) * th ))
+    gw=$(( (COLS - (n % COLS)) * tw )); gh=$(( th * (ROWS - (n / COLS)) ))
+    filters+=("${stack}xstack=inputs=$n:layout=$layout,drawbox=x=$gx:y=$gy:w=$gw:h=$gh:color=black@1:t=fill[out]")
+  else
+    filters+=("${stack}xstack=inputs=$n:layout=$layout[out]")
+  fi
   args+=(-filter_complex "$(IFS=';'; printf '%s' "${filters[*]}")" -map '[out]')
 else
   args+=(-filter_complex "${filters[0]}" -map '[v0]')
